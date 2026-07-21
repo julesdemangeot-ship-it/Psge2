@@ -1,0 +1,90 @@
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict
+import psge_engine as E
+
+# ---- infrastructure minimale (certificat + coordonnees) ----
+@dataclass
+class TopoCert:
+    boundary_validation: bool = True
+@dataclass
+class Certificate:
+    tetrahedra: tuple
+    topological_certificate: TopoCert = None
+    def __post_init__(self):
+        if self.topological_certificate is None:
+            self.topological_certificate = TopoCert()
+class DictCoords:
+    def __init__(self, verts): self._v={k:np.asarray(v,dtype=float) for k,v in verts.items()}
+    def vertex(self,v): return self._v[v]
+    def tetrahedron(self,tet): return tuple(self._v[i] for i in tet)
+    def edge_length(self,edge,metric,tensor):
+        a,b=edge; return float(np.linalg.norm(self._v[b]-self._v[a]))
+    def all_vertices(self): return dict(self._v)
+
+tensor3d = E.MetricTensor.euclidean(3)
+
+def deficit_of(report, edge):
+    r = report.get_report(tuple(sorted(edge)))
+    return None if r is None else r.deficit_angle
+
+print("="*68)
+print("POURQUOI 2 TETRAEDRES DONNENT DES ARTEFACTS DE BORD")
+print("="*68)
+print("""
+Avec 2 tetraedres partageant une FACE, l'arete commune de cette face est
+entouree de 2 tetras (charniere interne partielle), mais TOUTES les autres
+aretes n'ont qu'UN seul tetra -> deficit = 2pi - 1*diedre ~ proche de 2pi
+ou de pi. Ce sont des aretes de BORD : leur deficit n'est pas une courbure,
+c'est juste 'l'arete est au bord du maillage'. D'ou les 3.14 et 5.33 vus
+dans la capture.
+""")
+
+# 2 tetras partageant la face (0,1,2)
+verts = {0:[0,0,0], 1:[1,0,0], 2:[0.5,np.sqrt(3)/2,0], 3:[0.5,np.sqrt(3)/6,np.sqrt(2/3)],
+         4:[0.5,np.sqrt(3)/6,-np.sqrt(2/3)]}
+tets = [(0,1,2,3),(0,1,2,4)]
+rep = E.GeometryEngine(Certificate(tuple(tets)), DictCoords(verts),
+                       tensor=tensor3d).run()
+print(f"2 tetras : {rep.num_hinges_analyzed} charnieres, deficits (deg) :")
+for e in sorted({tuple(sorted((a,b))) for t in tets for i,a in enumerate(t) for b in t[i+1:]}):
+    d = deficit_of(rep, e)
+    n_around = sum(1 for t in tets if e[0] in t and e[1] in t)
+    tag = "INTERNE" if n_around>=3 else f"bord ({n_around} tetra)"
+    print(f"   arete {e}: {np.degrees(d):8.3f} deg   [{tag}]")
+
+print("\n" + "="*68)
+print("CAS CORRECT : une arete VRAIMENT interne, entouree de N tetraedres")
+print("="*68)
+print("""
+Pour avoir une charniere interne, il faut que l'arete soit entouree
+COMPLETEMENT par des tetraedres formant un anneau ferme. On construit
+un 'ombrelle' de N tetras reguliers autour de l'arete centrale (0,1).
+Comme l'angle diedre du tetra regulier est 70.53 deg et que 5*70.53=352.6,
+5 tetras ne ferment PAS (frustration = 7.36 deg, Test 16).
+""")
+
+dih = np.arccos(1/3)
+for N in [3, 4, 5, 6]:
+    verts2 = {0:[0,0,0], 1:[0,0,1]}
+    R = np.sqrt(3)/2
+    ext=[]; nid=2
+    for k in range(N+1):
+        ang=k*dih
+        verts2[nid]=[R*np.cos(ang), R*np.sin(ang), 0.5]; ext.append(nid); nid+=1
+    tets2=[(0,1,ext[k],ext[k+1]) for k in range(N)]
+    rep2 = E.GeometryEngine(Certificate(tuple(tets2)), DictCoords(verts2),
+                            tensor=tensor3d).run()
+    d_central = deficit_of(rep2, (0,1))
+    somme = 2*np.pi - d_central
+    print(f"  N={N} tetras autour de (0,1): somme dieres={np.degrees(somme):7.3f} deg, "
+          f"deficit={np.degrees(d_central):7.3f} deg  (2pi-{N}*70.53={np.degrees(2*np.pi-N*dih):.3f})")
+
+print("""
+LECTURE :
+  - N=5 donne deficit = +7.36 deg  -> FRUSTRATION icosaedrique (Test 16) : CORRECT
+  - N<5 donne deficit positif plus grand (pas assez de matiere -> courbure +)
+  - N=6 donnerait un recouvrement (somme>360) -> deficit negatif
+Le moteur mesure exactement la courbure de Regge concentree sur l'arete,
+DES QU'ON lui donne une vraie charniere interne au lieu de 2 tetras isoles.
+""")
