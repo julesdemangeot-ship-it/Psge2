@@ -1,0 +1,81 @@
+import numpy as np
+from dataclasses import dataclass
+from typing import Dict
+import psge_engine as E
+
+@dataclass
+class TopoCert:
+    boundary_validation: bool = True
+@dataclass
+class Certificate:
+    tetrahedra: tuple
+    topological_certificate: TopoCert = None
+    def __post_init__(self):
+        if self.topological_certificate is None:
+            self.topological_certificate = TopoCert()
+class DictCoords:
+    def __init__(self, verts): self._v = {k: np.asarray(val,dtype=float) for k,val in verts.items()}
+    def vertex(self,v): return self._v[v]
+    def tetrahedron(self,tet): return tuple(self._v[i] for i in tet)
+    def edge_length(self,edge,metric,tensor):
+        a,b=edge; return float(np.linalg.norm(self._v[b]-self._v[a]))
+    def all_vertices(self): return dict(self._v)
+
+print("="*66)
+print("TEST : un SEUL tetraedre regulier -- verifier l'angle diedre = 70.53 deg")
+print("="*66)
+# tetraedre regulier canonique
+s = 1.0
+verts = {
+    0: [0,0,0],
+    1: [1,0,0],
+    2: [0.5, np.sqrt(3)/2, 0],
+    3: [0.5, np.sqrt(3)/6, np.sqrt(2/3)],
+}
+tets = [(0,1,2,3)]
+cert = Certificate(tetrahedra=tuple(tets))
+coords = DictCoords(verts)
+tensor3d = E.MetricTensor.euclidean(3)
+engine = E.GeometryEngine(cert, coords, metric=E.MetricType.EUCLIDEAN, tensor=tensor3d)
+report = engine.run()
+
+print(f"\nAngle diedre theorique du tetraedre regulier : {np.degrees(np.arccos(1/3)):.6f} deg")
+print("\nDeficit par arete (pour UN seul tetra, deficit = 2pi - 1*diedre) :")
+for edge in sorted([(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]):
+    r = report.get_report(edge)
+    # pour un seul tetra, la somme des diedres = 1 diedre, donc on remonte le diedre :
+    diedre = 2*np.pi - r.deficit_angle
+    print(f"  arete {edge}: diedre mesure = {np.degrees(diedre):.4f} deg  (attendu 70.5288)")
+
+# volume du tetra regulier d'arete 1 = 1/(6 sqrt2)
+print(f"\nVolume total mesure : {report.total_volume:.6f}  (attendu {1/(6*np.sqrt(2)):.6f})")
+
+print("\n" + "="*66)
+print("TEST : deficit REEL avec de vrais tetras reguliers autour d'une arete")
+print("="*66)
+# On empile des tetras reguliers partageant l'arete (0,1), chacun tourne du
+# diedre exact autour de l'axe. Comme 5*70.53 = 352.6 < 360, il RESTE un trou :
+# c'est la frustration. On mesure le deficit apres avoir place autant de vrais
+# tetras reguliers que possible et en mesurant la somme reelle des diedres.
+dih = np.arccos(1/3)
+# arete (0,1) sur l'axe z
+verts2 = {0:[0,0,0], 1:[0,0,1]}
+# rayon d'un sommet de tetra regulier d'arete 1 par rapport a l'axe de l'arete
+# le 3e sommet d'un triangle equilateral d'arete 1 : a distance sqrt(3)/2 du milieu d'arete
+R = np.sqrt(3)/2
+nid = 2
+ext = []
+# 5 secteurs, angles 0, dih, 2dih, ... -- vrais tetras reguliers cette fois
+for k in range(6):  # on met 6 sommets pour former 5 tetras adjacents
+    ang = k*dih
+    verts2[nid] = [R*np.cos(ang), R*np.sin(ang), 0.5]
+    ext.append(nid); nid+=1
+tets2 = [(0,1,ext[k],ext[k+1]) for k in range(5)]
+cert2 = Certificate(tetrahedra=tuple(tets2))
+coords2 = DictCoords(verts2)
+engine2 = E.GeometryEngine(cert2, coords2, metric=E.MetricType.EUCLIDEAN, tensor=tensor3d)
+report2 = engine2.run()
+central = report2.get_report((0,1))
+print(f"\nSomme des diedres autour de (0,1) = {np.degrees(2*np.pi - central.deficit_angle):.4f} deg")
+print(f"Deficit de l'arete centrale       = {np.degrees(central.deficit_angle):.4f} deg")
+print(f"Attendu (2pi - 5*70.53)           = {np.degrees(2*np.pi - 5*dih):.4f} deg")
