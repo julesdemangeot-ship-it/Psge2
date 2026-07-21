@@ -1,0 +1,643 @@
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Tuple, Protocol, FrozenSet, Mapping
+from types import MappingProxyType
+from enum import Enum
+from math import factorial
+import numpy as np
+
+# ----------------------------------------------------------------------
+# 1. Hiérarchie d'Exceptions Scientifiques robustes
+# ----------------------------------------------------------------------
+class PSGEError(Exception):
+    """Classe de base pour toutes les erreurs spécifiques à PSGE II."""
+    pass
+
+
+class TopologyError(PSGEError):
+    """Levée en cas d'incohérence ou d'invalidité du certificat topologique."""
+    pass
+
+
+class MetricError(PSGEError):
+    """Levée en cas de dégénérescence métrique ou de signature invalide."""
+    pass
+
+
+class GeometryError(PSGEError):
+    """Levée en cas d'échec de calcul géométrique (dégénérescence, rang insuffisant)."""
+    pass
+
+
+# ----------------------------------------------------------------------
+# 2. États, Énumérations et Signes d'Orientation
+# ----------------------------------------------------------------------
+class GeometryStatus(Enum):
+    INVALID = 0
+    COMPUTED = 1
+    FAILED = 2
+
+
+class MetricType(Enum):
+    EUCLIDEAN = "Euclidean"
+    LORENTZIAN = "Lorentzian"
+
+
+class OrientationSign(Enum):
+    POSITIVE = 1
+    NEGATIVE = -1
+
+    @classmethod
+    def from_value(cls, val: float) -> 'OrientationSign':
+        return cls.POSITIVE if val >= 0 else cls.NEGATIVE
+
+
+class GramSignature(Enum):
+    EUCLIDEAN = "Euclidean"
+    SPACELIKE = "Spacelike"
+    TIMELIKE = "Timelike"
+    DEGENERATE = "Degenerate"
+
+
+# ----------------------------------------------------------------------
+# 3. Tenseur Métrique Généralisé (Encapsulation stricte et copie défensive)
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class MetricTensor:
+    _matrix: np.ndarray
+
+    def __post_init__(self):
+        matrix = np.array(object.__getattribute__(self, "_matrix"), dtype=float, copy=True)
+        matrix.setflags(write=False)
+        object.__setattr__(self, "_matrix", matrix)
+
+    def inner(self, u: np.ndarray, v: np.ndarray) -> float:
+        """Produit scalaire généralisé g(u, v) = u^T G v."""
+        return float(u.T @ self._matrix @ v)
+
+    def interval_sq(self, u: np.ndarray) -> float:
+        """Carré de l'intervalle d'espace-temps g(u, u)."""
+        return self.inner(u, u)
+
+    @classmethod
+    def euclidean(cls, dim: int) -> 'MetricTensor':
+        mat = np.eye(dim)
+        return cls(mat)
+
+    @classmethod
+    def minkowski(cls, dim: int = 4) -> 'MetricTensor':
+        mat = np.eye(dim)
+        mat[0, 0] = -1.0
+        return cls(mat)
+
+
+# ----------------------------------------------------------------------
+# 4. Structures de Données Immuables (Sécurisation NumPy et Stats dédiées)
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class IncidentCell:
+    simplex: Tuple[int, ...]
+    orientation: OrientationSign
+    incident_faces: Tuple[Tuple[int, int, int], ...]
+    opposite_vertices: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class FaceOrientation:
+    _normal: np.ndarray
+    orientation_sign: OrientationSign
+
+    def __post_init__(self):
+        # Sécurisation stricte du tableau numpy pour garantir l'immuabilité de la dataclass
+        normal = np.array(object.__getattribute__(self, "_normal"), dtype=float, copy=True)
+        normal.setflags(write=False)
+        object.__setattr__(self, "_normal", normal)
+
+    @property
+    def normal(self) -> np.ndarray:
+        return object.__getattribute__(self, "_normal")
+
+
+@dataclass(frozen=True)
+class ResolvedFaceOrientation:
+    _normal: np.ndarray
+    orientation_sign: OrientationSign
+    outward: bool
+
+    def __post_init__(self):
+        normal = np.array(object.__getattribute__(self, "_normal"), dtype=float, copy=True)
+        normal.setflags(write=False)
+        object.__setattr__(self, "_normal", normal)
+
+    @property
+    def normal(self) -> np.ndarray:
+        return object.__getattribute__(self, "_normal")
+
+
+@dataclass(frozen=True)
+class SimplexVolumeResult:
+    volume: float
+    gram_determinant: float
+    signature: GramSignature
+    is_valid: bool
+
+
+@dataclass(frozen=True)
+class DihedralAngleResult:
+    angle: float
+    raw_dot_product: float
+    is_clamped: bool
+    is_degenerate: bool
+
+
+@dataclass(frozen=True)
+class HingeTraversalResult:
+    hinge: Tuple[int, int]
+    incident_cells: Tuple[IncidentCell, ...]
+    dual_volume: float
+    opposite_vertices: Tuple[Tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class GeometryStatistics:
+    total_volume: float
+    edge_lengths: Tuple[float, ...]
+    gram_volumes: Tuple[float, ...]
+    num_simplices: int
+    num_degenerate_simplices_ignored: int
+
+
+class CoordinatesProvider(Protocol):
+    def vertex(self, v: int) -> np.ndarray:
+        ...
+    def tetrahedron(self, tet: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        ...
+    def edge_length(self, edge: Tuple[int, int], metric: MetricType, tensor: MetricTensor) -> float:
+        ...
+    def all_vertices(self) -> Dict[int, np.ndarray]:
+        ...
+
+
+# ----------------------------------------------------------------------
+# 5. Rapports Géométriques et de Courbure (Indexation O(1) et Diagnostics)
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class CurvatureReport:
+    edge: Tuple[int, int]
+    incident_cells: Tuple[IncidentCell, ...]
+    deficit_angle: float
+    hinge_measure: float
+    dual_volume: float
+    scalar_curvature: float
+
+
+@dataclass(frozen=True)
+class ReggeGeometryReport:
+    status: GeometryStatus
+    total_volume: float
+    total_action: float
+    average_scalar_curvature: float
+    maximum_deficit: float
+    minimum_deficit: float
+    total_deficit: float
+    max_edge_length: float
+    min_edge_length: float
+    num_hinges_analyzed: int
+    num_simplices: int
+    num_degenerate_simplices_ignored: int
+    min_gram_volume: float
+    max_gram_volume: float
+    curvature_reports: Tuple[CurvatureReport, ...]
+    _edge_index_map: Mapping[Tuple[int, int], CurvatureReport] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        mapping = {report.edge: report for report in self.curvature_reports}
+        object.__setattr__(self, '_edge_index_map', MappingProxyType(mapping))
+
+    def get_report(self, edge: Tuple[int, int]) -> Optional[CurvatureReport]:
+        """Permet une recherche en temps O(1) d'un rapport de courbure par son arête/charnière."""
+        return self._edge_index_map.get(edge)
+
+    def summary(self) -> str:
+        return (
+            f"=== REGGE DISCRETE GEOMETRY REPORT ===\n"
+            f" - Geometry Status          : {self.status.name}\n"
+            f" - Total Spacetime Volume   : {self.total_volume:.6f}\n"
+            f" - Regge Action (Einstein)  : {self.total_action:.6f}\n"
+            f" - Average Scalar Curvature : {self.average_scalar_curvature:.6f}\n"
+            f" - Deficit (Min / Max / Tot): {self.minimum_deficit:.4f} / {self.maximum_deficit:.4f} / {self.total_deficit:.4f}\n"
+            f" - Edge Length (Min / Max)  : {self.min_edge_length:.4f} / {self.max_edge_length:.4f}\n"
+            f" - Hinge Elements Analyzed  : {self.num_hinges_analyzed}\n"
+            f" - Simplices / Ignored      : {self.num_simplices} / {self.num_degenerate_simplices_ignored}\n"
+            f" - Gram Volume (Min / Max)  : {self.min_gram_volume:.6f} / {self.max_gram_volume:.6f}\n"
+            f"======================================"
+        )
+
+
+# ----------------------------------------------------------------------
+# 6. Composants Géométriques Spécialisés et Pipeline Local
+# ----------------------------------------------------------------------
+class EdgeMetric:
+    @staticmethod
+    def compute_edge_length(coords_a: np.ndarray, coords_b: np.ndarray, metric: MetricType = MetricType.EUCLIDEAN, tensor: Optional[MetricTensor] = None) -> float:
+        diff = coords_a - coords_b
+        dim = len(diff)
+        t = tensor if tensor else (MetricTensor.minkowski(dim) if metric == MetricType.LORENTZIAN else MetricTensor.euclidean(dim))
+        val = t.interval_sq(diff)
+        if val < 0:
+            return float(np.sqrt(-val))
+        return float(np.sqrt(val))
+
+
+class SimplexVolume:
+    @staticmethod
+    def compute_volume(coords: Tuple[np.ndarray, ...], tensor: MetricTensor, metric_type: MetricType = MetricType.EUCLIDEAN, strict: bool = True) -> SimplexVolumeResult:
+        v0 = coords[0]
+        vectors = [v - v0 for v in coords[1:]]
+        dim = len(vectors)
+        
+        gram = np.zeros((dim, dim))
+        for i in range(dim):
+            for j in range(dim):
+                gram[i, j] = tensor.inner(vectors[i], vectors[j])
+
+        rank = np.linalg.matrix_rank(gram)
+        if rank < dim:
+            if strict:
+                raise GeometryError(f"Simplexe dégénéré : rang de la matrice de Gram ({rank}) inférieur à la dimension ({dim}).")
+            return SimplexVolumeResult(volume=0.0, gram_determinant=0.0, signature=GramSignature.DEGENERATE, is_valid=False)
+
+        det = float(np.linalg.det(gram))
+        
+        if metric_type == MetricType.LORENTZIAN:
+            if det > 0:
+                sig = GramSignature.SPACELIKE
+            elif det < 0:
+                sig = GramSignature.TIMELIKE
+            else:
+                sig = GramSignature.DEGENERATE
+        else:
+            if det < 0:
+                if strict:
+                    raise GeometryError(f"Déterminant de Gram négatif ({det}) en métrique euclidienne.")
+                return SimplexVolumeResult(volume=0.0, gram_determinant=det, signature=GramSignature.DEGENERATE, is_valid=False)
+            sig = GramSignature.EUCLIDEAN
+
+        volume = float(np.sqrt(abs(det)) / factorial(dim))
+        return SimplexVolumeResult(volume=volume, gram_determinant=det, signature=sig, is_valid=True)
+
+
+class FaceExtractor:
+    @staticmethod
+    def extract_face_coords(tet_coords: Tuple[np.ndarray, ...], face_vertices: Tuple[int, int, int], tet_vertices: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        vertex_map = {tet_vertices[i]: tet_coords[i] for i in range(4)}
+        return (vertex_map[face_vertices[0]], vertex_map[face_vertices[1]], vertex_map[face_vertices[2]])
+
+
+class FaceNormalComputer:
+    @staticmethod
+    def compute_normal(face_coords: Tuple[np.ndarray, np.ndarray, np.ndarray], cell_orientation: OrientationSign) -> FaceOrientation:
+        v0, v1, v2 = face_coords
+        vec1 = v1 - v0
+        vec2 = v2 - v0
+        normal = np.cross(vec1, vec2)
+        norm = np.linalg.norm(normal)
+        if norm == 0:
+            raise GeometryError("Dégénérescence géométrique : face de mesure nulle.")
+        
+        unit_normal = normal / norm
+        return FaceOrientation(_normal=unit_normal, orientation_sign=cell_orientation)
+
+
+class OrientationResolver:
+    @staticmethod
+    def resolve_outward(face_orientation: FaceOrientation, face_coords: Tuple[np.ndarray, np.ndarray, np.ndarray], opposite_vertex_coord: np.ndarray, metric: MetricType = MetricType.EUCLIDEAN) -> ResolvedFaceOrientation:
+        if metric == MetricType.LORENTZIAN:
+            is_outward = (face_orientation.orientation_sign == OrientationSign.POSITIVE)
+        else:
+            v0, v1, v2 = face_coords
+            face_center = (v0 + v1 + v2) / 3.0
+            outward_dir = face_center - opposite_vertex_coord
+            is_outward = bool(np.dot(face_orientation.normal, outward_dir) >= 0)
+
+        return ResolvedFaceOrientation(
+            _normal=face_orientation.normal,
+            orientation_sign=face_orientation.orientation_sign,
+            outward=is_outward
+        )
+
+
+class DihedralAngleComputer:
+    @staticmethod
+    def compute_dihedral(norm1: np.ndarray, norm2: np.ndarray, tol: float = 1e-12) -> DihedralAngleResult:
+        norm1_len = np.linalg.norm(norm1)
+        norm2_len = np.linalg.norm(norm2)
+        
+        if norm1_len < tol or norm2_len < tol:
+            return DihedralAngleResult(
+                angle=0.0,
+                raw_dot_product=0.0,
+                is_clamped=False,
+                is_degenerate=True
+            )
+
+        dot_val = float(np.dot(norm1, norm2) / (norm1_len * norm2_len))
+        is_clamped = False
+        
+        if dot_val > 1.0:
+            dot_val = 1.0
+            is_clamped = True
+        elif dot_val < -1.0:
+            dot_val = -1.0
+            is_clamped = True
+            
+        angle = float(np.pi - np.arccos(dot_val))
+        is_degenerate = (abs(angle) < tol or abs(angle - np.pi) < tol)
+
+        return DihedralAngleResult(
+            angle=angle,
+            raw_dot_product=dot_val,
+            is_clamped=is_clamped,
+            is_degenerate=is_degenerate
+        )
+
+
+class DualCellComputer:
+    @staticmethod
+    def compute_dual_volume(edge: Tuple[int, int], incident_cells: Tuple[IncidentCell, ...],
+                            coords_provider: Optional[CoordinatesProvider] = None) -> float:
+        """Mesure de la charnière pour l'action de Regge en 4D : l'aire (2-volume) de
+        l'arête-charnière elle-même. En dimension 3, la charnière est une arête et sa
+        « mesure » pertinente pour l'action de Regge est sa longueur.
+
+        On retourne ici la longueur de l'arête, qui est la mesure de charnière correcte
+        pour l'action de Regge tridimensionnelle S = sum_hinges L(hinge) * deficit(hinge).
+        Sans coordonnées disponibles, on retombe sur 1.0 (mesure unité).
+        """
+        if coords_provider is None:
+            return 1.0
+        a, b = edge
+        pa = coords_provider.vertex(a)
+        pb = coords_provider.vertex(b)
+        length = float(np.linalg.norm(pb - pa))
+        return length if length > 0 else 1.0
+
+
+class DeficitComputer:
+    @staticmethod
+    def _dihedral_at_hinge(cell: IncidentCell, hinge: Tuple[int, int], coords_provider: CoordinatesProvider) -> float:
+        """Angle dièdre interne d'un tétraèdre le long de l'arête (charnière) `hinge`.
+
+        Dans un 3-simplexe, l'angle dièdre le long d'une arête {a,b} est l'angle
+        entre les deux faces triangulaires qui partagent cette arête. Il se calcule
+        proprement à partir des deux sommets opposés {c,d} : on projette les vecteurs
+        a->c et a->d sur le plan orthogonal à l'arête a->b, et l'angle entre ces
+        projections est l'angle dièdre.
+        """
+        a, b = hinge
+        # les deux autres sommets du tétraèdre (opposés à l'arête)
+        others = [v for v in cell.simplex if v not in (a, b)]
+        if len(others) != 2:
+            raise GeometryError(
+                f"Charnière {hinge} incompatible avec le simplexe {cell.simplex}."
+            )
+        c, d = others
+
+        pa = coords_provider.vertex(a)
+        pb = coords_provider.vertex(b)
+        pc = coords_provider.vertex(c)
+        pd = coords_provider.vertex(d)
+
+        edge = pb - pa
+        edge_norm = np.linalg.norm(edge)
+        if edge_norm < 1e-15:
+            raise GeometryError(f"Arête dégénérée {hinge} (longueur nulle).")
+        e_hat = edge / edge_norm
+
+        # projeter a->c et a->d sur le plan orthogonal à l'arête
+        vc = (pc - pa) - np.dot(pc - pa, e_hat) * e_hat
+        vd = (pd - pa) - np.dot(pd - pa, e_hat) * e_hat
+
+        nc = np.linalg.norm(vc)
+        nd = np.linalg.norm(vd)
+        if nc < 1e-15 or nd < 1e-15:
+            raise GeometryError(f"Projection dégénérée pour la charnière {hinge}.")
+
+        cos_theta = float(np.dot(vc, vd) / (nc * nd))
+        cos_theta = max(-1.0, min(1.0, cos_theta))  # clamp numérique
+        return float(np.arccos(cos_theta))
+
+    @classmethod
+    def compute_hinge_deficit(cls, hinge: Tuple[int, int], incident_cells: Tuple[IncidentCell, ...], coords_provider: CoordinatesProvider) -> float:
+        """Angle de déficit de Regge : delta = 2*pi - somme des dièdres autour de l'arête.
+
+        C'est la mesure exacte de la courbure concentrée sur la charnière. Un déficit
+        nul signifie que les tétraèdres se referment parfaitement autour de l'arête
+        (espace localement plat) ; un déficit positif signale une courbure positive
+        (frustration icosaédrique, Tests 16-19).
+        """
+        sum_dihedral = 0.0
+        for cell in incident_cells:
+            sum_dihedral += cls._dihedral_at_hinge(cell, hinge, coords_provider)
+        return float(2.0 * np.pi - sum_dihedral)
+
+
+class ReggeActionComputer:
+    @staticmethod
+    def compute_einstein_regge_action(curvature_reports: Tuple[CurvatureReport, ...]) -> float:
+        return sum(report.hinge_measure * report.deficit_angle for report in curvature_reports)
+
+
+# ----------------------------------------------------------------------
+# 7. Collecteur de Statistiques et Pipeline d'Orchestration Pur
+# ----------------------------------------------------------------------
+class GeometryStatisticsCollector:
+    @staticmethod
+    def collect(certificate, coords_provider: CoordinatesProvider, tensor: MetricTensor, metric: MetricType) -> GeometryStatistics:
+        """Collecte les mesures globales du maillage : volume total, longueurs d'arêtes,
+        volumes de Gram par simplexe, et comptage des simplexes (valides / dégénérés)."""
+        from itertools import combinations
+
+        tetrahedra = getattr(certificate, "tetrahedra", None)
+        if tetrahedra is None:
+            return GeometryStatistics(0.0, (), (), 0, 0)
+
+        total_volume = 0.0
+        edge_set = set()
+        edge_lengths_list = []
+        gram_volumes_list = []
+        num_simplices = 0
+        num_ignored = 0
+
+        for tet in tetrahedra:
+            tet = tuple(tet)
+            num_simplices += 1
+            coords = tuple(coords_provider.vertex(v) for v in tet)
+            try:
+                vol_result = SimplexVolume.compute_volume(coords, tensor, metric, strict=False)
+            except GeometryError:
+                num_ignored += 1
+                continue
+            if not vol_result.is_valid:
+                num_ignored += 1
+                continue
+            total_volume += vol_result.volume
+            gram_volumes_list.append(vol_result.volume)
+            # longueurs d'arêtes (chaque arête comptée une fois)
+            for a, b in combinations(sorted(tet), 2):
+                if (a, b) not in edge_set:
+                    edge_set.add((a, b))
+                    pa, pb = coords_provider.vertex(a), coords_provider.vertex(b)
+                    edge_lengths_list.append(float(np.linalg.norm(pb - pa)))
+
+        return GeometryStatistics(
+            total_volume=total_volume,
+            edge_lengths=tuple(edge_lengths_list),
+            gram_volumes=tuple(gram_volumes_list),
+            num_simplices=num_simplices,
+            num_degenerate_simplices_ignored=num_ignored
+        )
+
+
+class MeshTraversal:
+    @staticmethod
+    def extract_hinges_and_cells(certificate, coords_provider: Optional[CoordinatesProvider] = None) -> Tuple[HingeTraversalResult, ...]:
+        """Parcourt le maillage : pour chaque arête interne (charnière), rassemble tous
+        les tétraèdres qui la contiennent.
+
+        Le `certificate` doit exposer `tetrahedra` : un itérable de 4-uplets de sommets.
+        Chaque tétraèdre {v0,v1,v2,v3} possède 6 arêtes ; on regroupe les tétraèdres
+        par arête partagée pour reconstituer les charnières et leurs cellules incidentes.
+        """
+        from itertools import combinations
+
+        tetrahedra = getattr(certificate, "tetrahedra", None)
+        if tetrahedra is None:
+            return ()
+
+        # regrouper les tétraèdres par arête (charnière canonique : sommets triés)
+        hinge_to_cells: Dict[Tuple[int, int], list] = {}
+        for tet in tetrahedra:
+            tet = tuple(tet)
+            for a, b in combinations(sorted(tet), 2):
+                hinge = (a, b)
+                # sommets opposés à l'arête dans ce tétraèdre
+                opposite = tuple(v for v in tet if v not in (a, b))
+                # faces du tétraèdre incidentes à l'arête (les 2 faces contenant a et b)
+                faces = tuple(
+                    tuple(sorted(f)) for f in combinations(tet, 3) if a in f and b in f
+                )
+                cell = IncidentCell(
+                    simplex=tet,
+                    orientation=OrientationSign.POSITIVE,
+                    incident_faces=faces,
+                    opposite_vertices=opposite,
+                )
+                hinge_to_cells.setdefault(hinge, []).append((cell, opposite))
+
+        results = []
+        for hinge, cell_data in sorted(hinge_to_cells.items()):
+            cells = tuple(cd[0] for cd in cell_data)
+            opposites = tuple(cd[1] for cd in cell_data)
+            dual_vol = DualCellComputer.compute_dual_volume(hinge, cells, coords_provider)
+            results.append(HingeTraversalResult(
+                hinge=hinge,
+                incident_cells=cells,
+                dual_volume=dual_vol,
+                opposite_vertices=opposites,
+            ))
+        return tuple(results)
+
+
+class HingeAnalyzer:
+    @staticmethod
+    def analyze(hinge_result: HingeTraversalResult, coords_provider: CoordinatesProvider) -> CurvatureReport:
+        dual_vol = hinge_result.dual_volume
+        incident_cells = hinge_result.incident_cells
+        deficit = DeficitComputer.compute_hinge_deficit(hinge_result.hinge, incident_cells, coords_provider)
+
+        # La mesure de charnière est la mesure duale calculée (longueur d'arête en 3D)
+        hinge_measure = dual_vol
+        scalar_curv = deficit / dual_vol if dual_vol > 0 else 0.0
+
+        return CurvatureReport(
+            edge=hinge_result.hinge,
+            incident_cells=incident_cells,
+            deficit_angle=deficit,
+            hinge_measure=hinge_measure,
+            dual_volume=dual_vol,
+            scalar_curvature=scalar_curv
+        )
+
+
+class ReportAssembler:
+    @staticmethod
+    def assemble(
+        status: GeometryStatus,
+        reports: Tuple[CurvatureReport, ...],
+        stats: GeometryStatistics
+    ) -> ReggeGeometryReport:
+        total_action = ReggeActionComputer.compute_einstein_regge_action(reports)
+        num_hinges = len(reports)
+        total_deficit = sum(r.deficit_angle for r in reports)
+        avg_curvature = (total_deficit / num_hinges) if num_hinges > 0 else 0.0
+        
+        max_def = max((r.deficit_angle for r in reports), default=0.0)
+        min_def = min((r.deficit_angle for r in reports), default=0.0)
+        
+        max_len = max(stats.edge_lengths, default=0.0)
+        min_len = min(stats.edge_lengths, default=0.0)
+
+        min_gram = min(stats.gram_volumes, default=0.0)
+        max_gram = max(stats.gram_volumes, default=0.0)
+
+        return ReggeGeometryReport(
+            status=status,
+            total_volume=stats.total_volume,
+            total_action=total_action,
+            average_scalar_curvature=avg_curvature,
+            maximum_deficit=max_def,
+            minimum_deficit=min_def,
+            total_deficit=total_deficit,
+            max_edge_length=max_len,
+            min_edge_length=min_len,
+            num_hinges_analyzed=num_hinges,
+            num_simplices=stats.num_simplices,
+            num_degenerate_simplices_ignored=stats.num_degenerate_simplices_ignored,
+            min_gram_volume=min_gram,
+            max_gram_volume=max_gram,
+            curvature_reports=reports
+        )
+
+
+class GeometryEngine:
+    def __init__(self, psge_certificate, coords_provider: CoordinatesProvider, metric: MetricType = MetricType.EUCLIDEAN, tensor: Optional[MetricTensor] = None):
+        self.certificate = psge_certificate
+        self.coords = coords_provider
+        self.metric = metric
+        dim = 4
+        self.tensor = tensor if tensor else (MetricTensor.minkowski(dim) if metric == MetricType.LORENTZIAN else MetricTensor.euclidean(dim))
+
+    def run(self) -> ReggeGeometryReport:
+        if not self.certificate.topological_certificate.boundary_validation:
+            raise TopologyError("Échec : Le certificat topologique indique une frontière invalide ou non certifiée.")
+
+        try:
+            # Récupération propre via la structure GeometryStatistics
+            stats = GeometryStatisticsCollector.collect(
+                self.certificate, self.coords, self.tensor, self.metric
+            )
+
+            hinge_results = MeshTraversal.extract_hinges_and_cells(self.certificate, self.coords)
+            reports_list = [HingeAnalyzer.analyze(hr, self.coords) for hr in hinge_results]
+            reports_tuple = tuple(reports_list)
+
+            return ReportAssembler.assemble(
+                status=GeometryStatus.COMPUTED,
+                reports=reports_tuple,
+                stats=stats
+            )
+
+        except (TopologyError, MetricError, GeometryError) as exc:
+            raise exc
+        except Exception as exc:
+            raise GeometryError("Échec inattendu du calcul géométrique dans le moteur d'orchestration.") from exc
