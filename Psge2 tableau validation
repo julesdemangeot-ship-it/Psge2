@@ -1,0 +1,493 @@
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Tuple, Protocol, Mapping, List, Dict
+from types import MappingProxyType
+from enum import Enum
+from math import factorial
+
+# ==========================================
+# 1. ERREURS ET TOPOLOGIE
+# ==========================================
+class PSGEError(Exception): pass
+class GeometryError(PSGEError): pass
+
+class GeometryStatus(Enum):
+    INVALID = 0
+    COMPUTED = 1
+    FAILED = 2
+
+class MetricType(Enum):
+    EUCLIDEAN = "Euclidean"
+
+class OrientationSign(Enum):
+    POSITIVE = 1
+    NEGATIVE = -1
+
+class GramSignature(Enum):
+    EUCLIDEAN = "Euclidean"
+    DEGENERATE = "Degenerate"
+
+class DualType(Enum):
+    BARYCENTRIC = 1
+
+class HingeTopology(Enum):
+    INTERIOR = 1
+    BOUNDARY = 2
+    NON_MANIFOLD = 3
+    DEGENERATE = 4
+
+class CoordinatesProvider(Protocol):
+    def vertex(self, v: int) -> np.ndarray: ...
+
+
+# ==========================================
+# 2. BACKEND GÉOMÉTRIQUE TENSORIEL (MIS À NIVEAU)
+# ==========================================
+@dataclass(frozen=True)
+class MetricTensor:
+    _matrix: np.ndarray
+
+    def __post_init__(self):
+        matrix = np.array(object.__getattribute__(self, "_matrix"), dtype=float, copy=True)
+        if matrix.shape[0] != matrix.shape[1]:
+            raise GeometryError("La matrice métrique doit être carrée.")
+        if not np.allclose(matrix, matrix.T):
+            raise GeometryError("Le tenseur métrique doit être symétrique.")
+        matrix.setflags(write=False)
+        object.__setattr__(self, "_matrix", matrix)
+
+    def inner(self, u: np.ndarray, v: np.ndarray) -> float:
+        return float(u.T @ self._matrix @ v)
+
+    def norm2(self, v: np.ndarray) -> float:
+        return self.inner(v, v)
+
+    def norm(self, v: np.ndarray, eps: float = 1e-12) -> float:
+        val = self.norm2(v)
+        if val < -eps:
+            raise GeometryError(f"Norme carrée négative ({val:.6e}) incompatible avec une métrique euclidienne.")
+        return float(np.sqrt(max(0.0, val)))
+
+    def project_orthogonal(self, v: np.ndarray, direction: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+        d2 = self.norm2(direction)
+        if abs(d2) < eps:
+            return np.zeros_like(v)
+        return v - (self.inner(v, direction) / d2) * direction
+
+    def gram_matrix(self, vectors: List[np.ndarray]) -> np.ndarray:
+        n = len(vectors)
+        G = np.empty((n, n), dtype=float)
+        for i in range(n):
+            for j in range(n):
+                G[i, j] = self.inner(vectors[i], vectors[j])
+        return G
+
+    def gram_area(self, u: np.ndarray, v: np.ndarray, eps: float = 1e-12) -> float:
+        g11 = self.inner(u, u)
+        g22 = self.inner(v, v)
+        g12 = self.inner(u, v)
+        gram_det = g11 * g22 - g12 * g12
+        if gram_det < -eps:
+            raise GeometryError(f"Gram de surface indéfini ({gram_det:.6e}).")
+        return 0.5 * float(np.sqrt(max(0.0, gram_det)))
+
+    @classmethod
+    def euclidean(cls, dim: int) -> 'MetricTensor':
+        return cls(np.eye(dim))
+
+
+# ==========================================
+# 3. STRUCTURES DE DONNÉES ET DIAGNOSTICS
+# ==========================================
+@dataclass(frozen=True)
+class IncidentCell:
+    simplex: Tuple[int, ...]
+    orientation: OrientationSign
+    incident_faces: Tuple[Tuple[int, int, int], ...]
+    opposite_vertices: Tuple[int, ...]
+
+@dataclass(frozen=True)
+class SimplexVolumeResult:
+    volume: float
+    gram_determinant: float
+    signature: GramSignature
+    is_valid: bool
+
+@dataclass(frozen=True)
+class HingeTraversalResult:
+    hinge: Tuple[int, int]
+    incident_cells: Tuple[IncidentCell, ...]
+    dual_measure: float
+    topology: HingeTopology
+
+@dataclass(frozen=True)
+class CurvatureReport:
+    edge: Tuple[int, int]
+    incident_cells: Tuple[IncidentCell, ...]
+    deficit_angle: float
+    hinge_measure: float
+    dual_volume: float
+    scalar_curvature: float
+    topology: HingeTopology
+
+@dataclass(frozen=True)
+class GeometryStatistics:
+    total_volume: float
+    edge_lengths: Tuple[float, ...]
+    gram_volumes: Tuple[float, ...]
+    num_simplices: int
+    num_degenerate_simplices_ignored: int
+
+@dataclass(frozen=True)
+class ReggeGeometryReport:
+    status: GeometryStatus
+    total_volume: float
+    bulk_regge_sum: float
+    boundary_hinge_sum: float
+    total_geometric_sum: float
+    average_scalar_curvature: float
+    maximum_deficit: float
+    minimum_deficit: float
+    total_deficit: float
+    max_edge_length: float
+    min_edge_length: float
+    num_hinges_analyzed: int
+    num_simplices: int
+    num_degenerate_simplices_ignored: int
+    min_gram_volume: float
+    max_gram_volume: float
+    curvature_reports: Tuple[CurvatureReport, ...]
+    _edge_index_map: Mapping[Tuple[int, int], CurvatureReport] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        mapping = {report.edge: report for report in self.curvature_reports}
+        object.__setattr__(self, '_edge_index_map', MappingProxyType(mapping))
+
+    def get_report(self, edge: Tuple[int, int]) -> CurvatureReport:
+        return self._edge_index_map.get(tuple(sorted(edge)))
+
+
+# ==========================================
+# 4. ANALYSEUR TOPOLOGIQUE RIGOUREUX
+# ==========================================
+class HingeTopologyAnalyzer:
+    @staticmethod
+    def classify_link(incident_cells: Tuple[IncidentCell, ...]) -> HingeTopology:
+        if not incident_cells:
+            return HingeTopology.DEGENERATE
+
+        link_edges = set()
+        for cell in incident_cells:
+            others = tuple(sorted(cell.opposite_vertices))
+            if len(others) == 2:
+                link_edges.add(others)
+            elif len(others) > 2:
+                for i in range(len(others)):
+                    for j in range(i + 1, len(others)):
+                        link_edges.add(tuple(sorted((others[i], others[j]))))
+
+        degree: Dict[int, int] = {}
+        for u, v in link_edges:
+            degree[u] = degree.get(u, 0) + 1
+            degree[v] = degree.get(v, 0) + 1
+
+        if not degree:
+            return HingeTopology.DEGENERATE
+
+        num_vertices = len(degree)
+        num_edges = len(link_edges)
+        euler_char = num_vertices - num_edges  # Chi = 0 pour S^1
+
+        is_regular_deg2 = all(d == 2 for d in degree.values())
+        is_cycle_length = (num_edges == num_vertices)
+
+        start_node = list(degree.keys())[0]
+        visited = set()
+        queue = [start_node]
+        adjacency: Dict[int, List[int]] = {}
+        for u, v in link_edges:
+            adjacency.setdefault(u, []).append(v)
+            adjacency.setdefault(v, []).append(u)
+
+        while queue:
+            node = queue.pop(0)
+            if node not in visited:
+                visited.add(node)
+                for neighbor in adjacency.get(node, []):
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+
+        is_connected = (len(visited) == num_vertices)
+
+        if is_connected and is_regular_deg2 and is_cycle_length and (euler_char == 0):
+            return HingeTopology.INTERIOR
+        elif is_connected and not is_regular_deg2:
+            return HingeTopology.BOUNDARY
+        else:
+            return HingeTopology.NON_MANIFOLD
+
+
+# ==========================================
+# 5. OPÉRATEURS GÉOMÉTRIQUES DÉCOUPLÉS
+# ==========================================
+class BarycentricDualCell:
+    def compute_measure(self, edge: Tuple[int, int], incident_cells: Tuple[IncidentCell, ...], coords_provider: CoordinatesProvider, tensor: MetricTensor) -> float:
+        if coords_provider is None: 
+            return 1.0
+        a, b = edge
+        pa = coords_provider.vertex(a)
+        pb = coords_provider.vertex(b)
+        edge_vec = pb - pa
+        
+        if tensor.norm2(edge_vec) < 1e-15: 
+            return 0.0
+            
+        dual_area_sum = 0.0
+        for cell in incident_cells:
+            tet_coords = [coords_provider.vertex(v) for v in cell.simplex]
+            tet_barycenter = sum(tet_coords) / len(tet_coords)
+            others = [v for v in cell.simplex if v != a and v != b]
+            for c in others:
+                pc = coords_provider.vertex(c)
+                face_barycenter = (pa + pb + pc) / 3.0
+                mid_ab = 0.5 * (pa + pb)
+                v1 = face_barycenter - mid_ab
+                v2 = tet_barycenter - mid_ab
+                
+                triangle_area = tensor.gram_area(v1, v2)
+                dual_area_sum += triangle_area
+                
+        return float(dual_area_sum)
+
+class SimplexVolume:
+    @staticmethod
+    def compute_volume(coords, tensor: MetricTensor, strict: bool = True) -> SimplexVolumeResult:
+        v0 = coords[0]
+        vectors = [v - v0 for v in coords[1:]]
+        dim = len(vectors)
+        gram = tensor.gram_matrix(vectors)
+        
+        rank = np.linalg.matrix_rank(gram)
+        if rank < dim:
+            if strict: 
+                raise GeometryError("Simplexe dégénéré rencontré.")
+            return SimplexVolumeResult(0.0, 0.0, GramSignature.DEGENERATE, False)
+            
+        det = float(np.linalg.det(gram))
+        if det <= 0:
+            if strict:
+                raise GeometryError(f"Déterminant de Gram non strictement positif ({det:.6e}).")
+            return SimplexVolumeResult(0.0, det, GramSignature.DEGENERATE, False)
+            
+        return SimplexVolumeResult(float(np.sqrt(det) / factorial(dim)), det, GramSignature.EUCLIDEAN, True)
+
+class DeficitComputer:
+    @staticmethod
+    def _dihedral_at_hinge(cell: IncidentCell, hinge: Tuple[int, int], coords_provider: CoordinatesProvider, tensor: MetricTensor) -> float:
+        a, b = hinge
+        others = [v for v in cell.simplex if v not in (a, b)]
+        pa, pb = coords_provider.vertex(a), coords_provider.vertex(b)
+        pc, pd = coords_provider.vertex(others[0]), coords_provider.vertex(others[1])
+        
+        edge = pb - pa
+        vc = tensor.project_orthogonal(pc - pa, edge)
+        vd = tensor.project_orthogonal(pd - pa, edge)
+        
+        nc = tensor.norm(vc)
+        nd = tensor.norm(vd)
+        
+        if nc < 1e-12 or nd < 1e-12:
+            return 0.0
+            
+        cos_theta = max(-1.0, min(1.0, tensor.inner(vc, vd) / (nc * nd)))
+        return float(np.arccos(cos_theta))
+
+    @classmethod
+    def compute_hinge_deficit(cls, hinge: Tuple[int, int], incident_cells: Tuple[IncidentCell, ...], coords_provider: CoordinatesProvider, tensor: MetricTensor) -> float:
+        return float(2.0 * np.pi - sum(cls._dihedral_at_hinge(cell, hinge, coords_provider, tensor) for cell in incident_cells))
+
+class GeometryEngine:
+    def __init__(self, cert, coords_provider, tensor: MetricTensor = None):
+        self.certificate = cert
+        self.coords = coords_provider
+        self.tensor = tensor if tensor else MetricTensor.euclidean(3)
+        self.dual_strategy = BarycentricDualCell()
+
+    def run(self) -> ReggeGeometryReport:
+        from itertools import combinations
+        total_volume, num_simplices, num_ignored = 0.0, 0, 0
+        edge_set, edge_lengths_list, gram_volumes_list = set(), [], []
+        
+        for tet in self.certificate.tetrahedra:
+            num_simplices += 1
+            coords = tuple(self.coords.vertex(v) for v in tet)
+            vol_result = SimplexVolume.compute_volume(coords, self.tensor, strict=False)
+            if not vol_result.is_valid:
+                num_ignored += 1
+                continue
+            total_volume += vol_result.volume
+            gram_volumes_list.append(vol_result.volume)
+            for a, b in combinations(sorted(tet), 2):
+                if (a, b) not in edge_set:
+                    edge_set.add((a, b))
+                    edge_lengths_list.append(self.tensor.norm(self.coords.vertex(b) - self.coords.vertex(a)))
+                    
+        stats = GeometryStatistics(total_volume, tuple(edge_lengths_list), tuple(gram_volumes_list), num_simplices, num_ignored)
+
+        hinge_to_cells = {}
+        for tet in self.certificate.tetrahedra:
+            tet_t = tuple(tet)
+            for a, b in combinations(sorted(tet_t), 2):
+                faces = tuple(tuple(sorted(f)) for f in combinations(tet_t, 3) if a in f and b in f)
+                opposite = tuple(v for v in tet_t if v not in (a, b))
+                cell = IncidentCell(tet_t, OrientationSign.POSITIVE, faces, opposite)
+                hinge_to_cells.setdefault((a, b), []).append(cell)
+
+        reports = []
+        for h, cells in sorted(hinge_to_cells.items()):
+            cells_t = tuple(cells)
+            topo = HingeTopologyAnalyzer.classify_link(cells_t)
+            measure = self.dual_strategy.compute_measure(h, cells_t, self.coords, self.tensor)
+            deficit = DeficitComputer.compute_hinge_deficit(h, cells_t, self.coords, self.tensor)
+            curv = deficit / measure if measure > 0 else 0.0
+            reports.append(CurvatureReport(h, cells_t, deficit, measure, measure, curv, topo))
+
+        reports_t = tuple(reports)
+        num_h = len(reports_t)
+        tot_def = sum(r.deficit_angle for r in reports_t)
+        
+        bulk_sum = sum(r.hinge_measure * r.deficit_angle for r in reports_t if r.topology == HingeTopology.INTERIOR)
+        boundary_sum = sum(r.hinge_measure * r.deficit_angle for r in reports_t if r.topology == HingeTopology.BOUNDARY)
+        total_sum = sum(r.hinge_measure * r.deficit_angle for r in reports_t)
+
+        return ReggeGeometryReport(
+            GeometryStatus.COMPUTED, stats.total_volume, bulk_sum, boundary_sum, total_sum,
+            tot_def / num_h if num_h > 0 else 0.0, max((r.deficit_angle for r in reports_t), default=0.0),
+            min((r.deficit_angle for r in reports_t), default=0.0), tot_def,
+            max(stats.edge_lengths, default=0.0), min(stats.edge_lengths, default=0.0),
+            num_h, stats.num_simplices, stats.num_degenerate_simplices_ignored,
+            min(stats.gram_volumes, default=0.0), max(stats.gram_volumes, default=0.0), reports_t
+        )
+
+
+# ==========================================
+# 6. MATRICE DE TESTS DE VALIDATION (PHASE I)
+# ==========================================
+@dataclass
+class Certificate:
+    tetrahedra: tuple
+
+class DictCoords:
+    def __init__(self, verts): 
+        self._v = {k: np.asarray(v, dtype=float) for k, v in verts.items()}
+    def vertex(self, v): 
+        return self._v[v]
+
+class PSGETestSuite:
+    @staticmethod
+    def run_all_tests():
+        print("="*68)
+        print("   PSGE II — MATRICE DE VALIDATION DES INVARIANTS MATHÉMATIQUES")
+        print("="*68 + "\n")
+        
+        tensor3d = MetricTensor.euclidean(3)
+        
+        # Test 1 : Volume du Tétraèdre Régulier (arête unitaire a = 1)
+        v_reg = {
+            0: [0.0, 0.0, 0.0],
+            1: [1.0, 0.0, 0.0],
+            2: [0.5, np.sqrt(3)/2, 0.0],
+            3: [0.5, np.sqrt(3)/6, np.sqrt(6)/3]
+        }
+        res_vol = SimplexVolume.compute_volume([np.array(v) for v in v_reg.values()], tensor3d)
+        expected_vol = 1.0 / (6.0 * np.sqrt(2))
+        assert np.isclose(res_vol.volume, expected_vol), f"Échec volume tétraèdre régulier ({res_vol.volume} vs {expected_vol})."
+        print(f"✅ Test 1 : Volume Tétraèdre Régulier    : {res_vol.volume:.6f} (Attendu: {expected_vol:.6f})")
+
+        # Test 2 : Rejet du Simplexe Dégénéré
+        v_deg = {0: [0,0,0], 1: [1,0,0], 2: [2,0,0], 3: [0,1,0]}
+        res_deg = SimplexVolume.compute_volume([np.array(v) for v in v_deg.values()], tensor3d, strict=False)
+        assert not res_deg.is_valid, "Échec détection dégénérescence."
+        print("✅ Test 2 : Simplexe Dégénéré             : Rejeté avec succès (is_valid=False)")
+
+        # Test 3 : Éventail de 5 tétraèdres (Gap exact 7.356°)
+        dih = np.arccos(1/3)
+        v_umb = {0: [0,0,0], 1: [0,0,1]}
+        R = np.sqrt(3)/2
+        for k in range(6):
+            ang = k * dih
+            v_umb[2+k] = [R*np.cos(ang), R*np.sin(ang), 0.5]
+        tets_umb = [(0, 1, 2+k, 3+k) for k in range(5)]
+        rep_umb = GeometryEngine(Certificate(tuple(tets_umb)), DictCoords(v_umb), tensor3d).run()
+        report_01 = rep_umb.get_report((0, 1))
+        expected_gap = 2*np.pi - 5*dih
+        assert report_01.topology == HingeTopology.BOUNDARY, "L'arête (0,1) doit être BOUNDARY."
+        assert np.isclose(report_01.deficit_angle, expected_gap), "Gap d'éventail incorrect."
+        print(f"✅ Test 3 : Éventail de 5 Tétraèdres      : Déficit = {np.degrees(report_01.deficit_angle):.4f}° | Topo = {report_01.topology.name}")
+
+        # Test 4 : Anneau plat fermé de 6 tétraèdres (Bulk purement INTERIOR)
+        verts_ring = {0: [0,0,0], 1: [0,0,1]}
+        for k in range(6):
+            ang = k * (2 * np.pi / 6.0)
+            verts_ring[2+k] = [R*np.cos(ang), R*np.sin(ang), 0.5]
+        tets_ring = [(0, 1, 2, 3), (0, 1, 3, 4), (0, 1, 4, 5), (0, 1, 5, 6), (0, 1, 6, 7), (0, 1, 7, 2)]
+        rep_ring = GeometryEngine(Certificate(tuple(tets_ring)), DictCoords(verts_ring), tensor3d).run()
+        report_ring_01 = rep_ring.get_report((0, 1))
+        assert report_ring_01.topology == HingeTopology.INTERIOR, "L'arête (0,1) de l'anneau doit être INTERIOR."
+        assert np.isclose(report_ring_01.deficit_angle, 0.0, atol=1e-12), "Le déficit plat doit être zéro."
+        print(f"✅ Test 4 : Anneau Plat Fermé (6)        : Charnière (0,1) = {report_ring_01.topology.name} | Déficit = {report_ring_01.deficit_angle:.2e} rad")
+
+        # Test 5 : Diagnostic Rigoureux de l'Anneau Perturbé
+        v_pert = {k: np.array(v, dtype=float) for k, v in verts_ring.items()}
+        v_pert[4] += np.array([0.15, -0.10, 0.20])
+        v_pert[5] *= 1.15
+        
+        rep_pert = GeometryEngine(
+            Certificate(tuple(tets_ring)),
+            DictCoords(v_pert),
+            tensor=tensor3d
+        ).run()
+        
+        r0 = rep_ring.get_report((0, 1))
+        r1 = rep_pert.get_report((0, 1))
+        
+        print("\n--- DIAGNOSTICS DU TEST 5 (ANNEAU PERTURBÉ) ---")
+        print(f"δ_sym (avant)   = {r0.deficit_angle:.6e} rad")
+        print(f"δ_pert (après)  = {r1.deficit_angle:.6e} rad")
+        print(f"Δδ (différence) = {r1.deficit_angle - r0.deficit_angle:.6e} rad")
+        
+        angles_0 = [
+            DeficitComputer._dihedral_at_hinge(cell, (0, 1), DictCoords(verts_ring), tensor3d)
+            for cell in r0.incident_cells
+        ]
+        angles_1 = [
+            DeficitComputer._dihedral_at_hinge(cell, (0, 1), DictCoords(v_pert), tensor3d)
+            for cell in r1.incident_cells
+        ]
+        
+        delta = np.array(angles_1) - np.array(angles_0)
+        print("Variation des angles (°) :")
+        print(np.degrees(delta))
+        
+        print(f"Somme avant : {np.degrees(np.sum(angles_0)):.12f}°")
+        print(f"Somme après : {np.degrees(np.sum(angles_1)):.12f}°")
+        print(f"Δ Somme     : {np.degrees(np.sum(delta)):.12e}°")
+        
+        assert r1.topology == HingeTopology.INTERIOR
+        assert np.isfinite(r1.deficit_angle)
+        assert np.linalg.norm(delta) > 1e-8, "Aucun angle dièdre n'a varié."
+        print("✅ Test 5 : Anneau Perturbé validé avec succès par diagnostic géométrique.\n")
+
+        # Test 6 : Invariance Isométrique (Translation + Rotation)
+        R_rot = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+        v_trans = {k: R_rot @ (v + np.array([10.0, -5.0, 3.0])) for k, v in v_pert.items()}
+        rep_trans = GeometryEngine(Certificate(tuple(tets_ring)), DictCoords(v_trans), tensor=tensor3d).run()
+        assert np.isclose(rep_trans.bulk_regge_sum, rep_pert.bulk_regge_sum), "Échec d'invariance par isométrie."
+        print(f"✅ Test 6 : Invariance par Isométrie       : Bulk Action conservée ({rep_trans.bulk_regge_sum:.6f})")
+
+        print("\n" + "="*68)
+        print("   TOUS LES INVARIANTS MATHÉMATIQUES ET TOPOLOGIQUES SONT VALIDÉS")
+        print("="*68)
+
+# Lancement direct de la suite de tests
+PSGETestSuite.run_all_tests()
