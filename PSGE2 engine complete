@@ -614,8 +614,13 @@ class GeometryEngine:
         self.certificate = psge_certificate
         self.coords = coords_provider
         self.metric = metric
-        dim = 4
-        self.tensor = tensor if tensor else (MetricTensor.minkowski(dim) if metric == MetricType.LORENTZIAN else MetricTensor.euclidean(dim))
+        if tensor is not None:
+            self.tensor = tensor
+        else:
+            # Infer dimension from the first available vertex coordinate
+            vertices = coords_provider.all_vertices()
+            dim = len(next(iter(vertices.values()))) if vertices else 4
+            self.tensor = MetricTensor.minkowski(dim) if metric == MetricType.LORENTZIAN else MetricTensor.euclidean(dim)
 
     def run(self) -> ReggeGeometryReport:
         if not self.certificate.topological_certificate.boundary_validation:
@@ -641,3 +646,164 @@ class GeometryEngine:
             raise exc
         except Exception as exc:
             raise GeometryError("Échec inattendu du calcul géométrique dans le moteur d'orchestration.") from exc
+
+
+# ----------------------------------------------------------------------
+# 9. Universe — API haut-niveau pour la géométrie simpliciale discrète
+# ----------------------------------------------------------------------
+
+@dataclass
+class _TopologicalCertificate:
+    """Certificat topologique minimal pour l'API Universe."""
+    boundary_validation: bool = True
+
+
+@dataclass
+class _UniverseCertificate:
+    """Certificat interne construit par l'API Universe."""
+    tetrahedra: tuple
+    topological_certificate: _TopologicalCertificate = field(default_factory=_TopologicalCertificate)
+
+
+class _UniverseCoords:
+    """Fournisseur de coordonnées interne pour l'API Universe."""
+
+    def __init__(self, vertices: Dict[int, np.ndarray]):
+        self._v: Dict[int, np.ndarray] = {k: np.asarray(v, dtype=float) for k, v in vertices.items()}
+
+    def vertex(self, v: int) -> np.ndarray:
+        return self._v[v]
+
+    def tetrahedron(self, tet: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        return tuple(self._v[i] for i in tet)
+
+    def edge_length(self, edge: Tuple[int, int], metric: MetricType = MetricType.EUCLIDEAN, tensor: Optional[MetricTensor] = None) -> float:
+        a, b = edge
+        return float(np.linalg.norm(self._v[b] - self._v[a]))
+
+    def all_vertices(self) -> Dict[int, np.ndarray]:
+        return dict(self._v)
+
+
+class Universe:
+    """Point d'entrée haut-niveau pour la construction et l'analyse d'un univers simplicial.
+
+    Représente une variété simpliciale 3D discrète (ensemble de tétraèdres avec
+    leurs sommets). Fournit une API fluide pour construire le maillage et lancer
+    le calcul de géométrie de Regge sans manipulation manuelle des certificats
+    ou des fournisseurs de coordonnées.
+
+    La dimension de la métrique est inférée automatiquement à partir des
+    coordonnées des sommets au moment du calcul.
+
+    Example::
+
+        import numpy as np
+
+        u = Universe()
+        u.add_vertex(0, [0, 0, 0])
+        u.add_vertex(1, [1, 0, 0])
+        u.add_vertex(2, [0.5, np.sqrt(3)/2, 0])
+        u.add_vertex(3, [0.5, np.sqrt(3)/6, np.sqrt(6)/3])
+        u.add_tetrahedron(0, 1, 2, 3)
+        report = u.compute()
+        print(report.summary())
+    """
+
+    def __init__(self, metric: MetricType = MetricType.EUCLIDEAN, tensor: Optional[MetricTensor] = None):
+        """Initialise un univers simplicial vide.
+
+        Args:
+            metric: Type de métrique (EUCLIDEAN ou LORENTZIAN). Défaut : EUCLIDEAN.
+            tensor: Tenseur métrique explicite. Si None, inféré de la dimension
+                    des coordonnées lors de l'appel à :meth:`compute`.
+        """
+        self._vertices: Dict[int, np.ndarray] = {}
+        self._tetrahedra: list = []
+        self.metric = metric
+        self._tensor = tensor
+
+    def add_vertex(self, vertex_id: int, coords) -> 'Universe':
+        """Ajoute ou met à jour un sommet avec ses coordonnées.
+
+        Args:
+            vertex_id: Identifiant entier du sommet.
+            coords: Coordonnées du sommet (liste, tuple ou ndarray).
+
+        Returns:
+            self — permet le chaînage fluide.
+        """
+        self._vertices[vertex_id] = np.asarray(coords, dtype=float)
+        return self
+
+    def add_tetrahedron(self, v0: int, v1: int, v2: int, v3: int) -> 'Universe':
+        """Ajoute un tétraèdre défini par ses quatre indices de sommets.
+
+        Si le même quadruplet ordonné est déjà présent, il est ignoré.
+
+        Args:
+            v0, v1, v2, v3: Indices des quatre sommets du tétraèdre.
+
+        Returns:
+            self — permet le chaînage fluide.
+        """
+        tet = (v0, v1, v2, v3)
+        if tet not in self._tetrahedra:
+            self._tetrahedra.append(tet)
+        return self
+
+    @property
+    def vertex_count(self) -> int:
+        """Nombre de sommets définis dans l'univers."""
+        return len(self._vertices)
+
+    @property
+    def tetrahedron_count(self) -> int:
+        """Nombre de tétraèdres dans l'univers."""
+        return len(self._tetrahedra)
+
+    def compute(self, tensor: Optional[MetricTensor] = None) -> ReggeGeometryReport:
+        """Lance le calcul de géométrie de Regge sur l'univers.
+
+        Construit automatiquement le certificat topologique et le fournisseur
+        de coordonnées, puis orchestre le moteur géométrique.
+
+        Args:
+            tensor: Tenseur métrique à utiliser pour ce calcul (prioritaire sur
+                    celui éventuellement fourni à l'initialisation). Si None,
+                    la dimension est inférée des coordonnées.
+
+        Returns:
+            ReggeGeometryReport — rapport complet de courbure de Regge.
+
+        Raises:
+            TopologyError: Si l'univers est vide ou contient des références
+                           à des sommets non définis.
+        """
+        if not self._vertices:
+            raise TopologyError("L'univers ne contient aucun sommet.")
+        if not self._tetrahedra:
+            raise TopologyError("L'univers ne contient aucun tétraèdre.")
+
+        missing = sorted({v for tet in self._tetrahedra for v in tet if v not in self._vertices})
+        if missing:
+            raise TopologyError(
+                f"Les sommets suivants sont référencés dans des tétraèdres mais non définis : {missing}."
+            )
+
+        t = tensor or self._tensor
+        if t is None:
+            dim = len(next(iter(self._vertices.values())))
+            t = MetricTensor.minkowski(dim) if self.metric == MetricType.LORENTZIAN else MetricTensor.euclidean(dim)
+
+        cert = _UniverseCertificate(tuple(self._tetrahedra))
+        coords = _UniverseCoords(self._vertices)
+        engine = GeometryEngine(cert, coords, metric=self.metric, tensor=t)
+        return engine.run()
+
+    def __repr__(self) -> str:
+        return (
+            f"Universe(metric={self.metric.value!r}, "
+            f"vertices={self.vertex_count}, "
+            f"tetrahedra={self.tetrahedron_count})"
+        )
